@@ -20,6 +20,8 @@ mod stress_test;
 mod test;
 #[cfg(test)]
 mod test_finalization;
+#[cfg(test)]
+mod test_rollback;
 mod types;
 mod validation;
 
