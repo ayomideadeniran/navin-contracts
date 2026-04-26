@@ -18,7 +18,7 @@
 //! Each event uses a single descriptive `Symbol` as its topic so that
 //! consumers can filter by topic when subscribing to contract events.
 
-use crate::types::{BreachType, Role, RoleChangeAction, Severity, ShipmentStatus};
+use crate::types::{BreachType, MigrationReport, Role, RoleChangeAction, Severity, ShipmentStatus};
 use soroban_sdk::{xdr::ToXdr, Address, BytesN, Env, Symbol};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 2;
@@ -27,7 +27,28 @@ fn next_event_counter(env: &Env, shipment_id: u64) -> u32 {
     crate::storage::get_event_count(env, shipment_id).saturating_add(1)
 }
 
-fn generate_idempotency_key(
+/// Compute the canonical idempotency key for an event.
+///
+/// The idempotency key is a SHA-256 hash of a canonical binary payload
+/// consisting of three fields concatenated in order:
+///
+/// 1. `shipment_id` as big-endian u64 (8 bytes)
+/// 2. `event_type` as XDR-encoded Symbol (length-prefixed string)
+/// 3. `event_counter` as big-endian u32 (4 bytes)
+///
+/// This deterministic encoding ensures that all parties (on-chain and
+/// off-chain indexers) can independently compute the same key for a given
+/// event, enabling reliable deduplication.
+///
+/// # Arguments
+/// * `env` - The execution environment.
+/// * `shipment_id` - The shipment identifier.
+/// * `event_type` - The event type string (must match a topic constant).
+/// * `event_counter` - The per-shipment monotonically increasing event counter.
+///
+/// # Returns
+/// * `BytesN<32>` - The idempotency key.
+pub fn generate_idempotency_key(
     env: &Env,
     shipment_id: u64,
     event_type: &str,
@@ -168,7 +189,7 @@ pub fn emit_status_updated(
 ///
 /// Milestones are **never stored on-chain** — this is the canonical example
 /// of the Hash-and-Emit pattern. The full milestone payload (GPS coordinates,
-/// temperature readings, photos) lives off-chain; only its hash is emitted.
+/// temperature readings, photos) lives off-chain; only its hash is published.
 ///
 /// # Event Data
 ///
@@ -225,6 +246,8 @@ pub fn emit_milestone_recorded(
         ),
     );
     crate::storage::increment_event_count(env, shipment_id);
+    // Also track milestone-specific count for payload size guard
+    crate::storage::increment_milestone_event_count(env, shipment_id);
 }
 
 /// Emits an `escrow_deposited` event when funds are locked for a shipment.
@@ -504,6 +527,30 @@ pub fn emit_contract_upgraded(
     env.events().publish(
         (Symbol::new(env, crate::event_topics::CONTRACT_UPGRADED),),
         (admin.clone(), new_wasm_hash.clone(), version),
+    );
+}
+
+/// Emits a `migration_reported` event summarizing the impact of an upgrade.
+///
+/// # Event Data
+///
+/// | Field            | Type              | Description                                |
+/// |------------------|-------------------|--------------------------------------------|
+/// | current_version  | `u32`             | Version before migration                    |
+/// | target_version   | `u32`             | Version after migration                     |
+/// | affected_entries | `u64`             | Count of entries involved in the migration  |
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `report` - Structured migration metrics.
+pub fn emit_migration_report(env: &Env, report: &MigrationReport) {
+    env.events().publish(
+        (Symbol::new(env, crate::event_topics::MIGRATION_REPORTED),),
+        (
+            report.current_version,
+            report.target_version,
+            report.affected_shipments,
+        ),
     );
 }
 

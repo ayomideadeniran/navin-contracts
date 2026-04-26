@@ -9,7 +9,7 @@ use crate::{
 use soroban_sdk::{
     contract, contracterror, contractimpl,
     testutils::{storage::Persistent, Address as _, Events},
-    Address, BytesN, Env, Symbol, TryFromVal,
+    Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
 };
 
 #[contract]
@@ -2459,7 +2459,7 @@ fn test_record_milestones_batch_max_size() {
     let mut milestones = soroban_sdk::Vec::new(&env);
     for i in 0..10 {
         milestones.push_back((
-            Symbol::new(&env, &std::format!("checkpoint_{}", i)),
+            Symbol::new(&env, &std::format!("checkpoint_{i}")),
             BytesN::from_array(&env, &[i as u8; 32]),
         ));
     }
@@ -2510,7 +2510,7 @@ fn test_record_milestones_batch_oversized() {
     let mut milestones = soroban_sdk::Vec::new(&env);
     for i in 0..11 {
         milestones.push_back((
-            Symbol::new(&env, &std::format!("checkpoint_{}", i)),
+            Symbol::new(&env, &std::format!("checkpoint_{i}")),
             BytesN::from_array(&env, &[i as u8; 32]),
         ));
     }
@@ -3314,7 +3314,7 @@ fn test_upgrade_success() {
     // Drain events emitted by initialize so we can assert only on upgrade events
     let _ = env.events().all();
 
-    client.upgrade(&admin, &new_wasm_hash);
+    client.upgrade(&admin, &new_wasm_hash, &2);
 
     // Capture events immediately after upgrade before any further calls flush the queue
     let events = env.events().all();
@@ -3345,7 +3345,7 @@ fn test_upgrade_unauthorized() {
 
     client.initialize(&admin, &token_contract);
 
-    client.upgrade(&non_admin, &new_wasm_hash);
+    client.upgrade(&non_admin, &new_wasm_hash, &2);
 }
 
 // ============= Contract Metadata Tests =============
@@ -3424,7 +3424,7 @@ fn test_get_version_after_upgrade() {
     client.initialize(&admin, &token_contract);
     assert_eq!(client.get_version(), 1);
 
-    client.upgrade(&admin, &new_wasm_hash);
+    client.upgrade(&admin, &new_wasm_hash, &2);
 
     let version: u32 = env.as_contract(&client.address, || {
         env.storage()
@@ -3450,7 +3450,7 @@ fn test_get_contract_metadata_after_upgrade() {
     assert_eq!(meta_before.shipment_count, 0);
     assert!(meta_before.initialized);
 
-    client.upgrade(&admin, &new_wasm_hash);
+    client.upgrade(&admin, &new_wasm_hash, &2);
 
     let version: u32 = env.as_contract(&client.address, || {
         env.storage()
@@ -3459,6 +3459,45 @@ fn test_get_contract_metadata_after_upgrade() {
             .unwrap()
     });
     assert_eq!(version, 2);
+}
+
+#[test]
+fn test_get_hash_algo_version() {
+    let (_env, client, admin, token_contract) = setup_shipment_env();
+    client.initialize(&admin, &token_contract);
+    assert_eq!(client.get_hash_algo_version(), crate::DEFAULT_HASH_ALGO);
+}
+
+#[test]
+fn test_dry_run_migration_success() {
+    let (_env, client, admin, token_contract) = setup_shipment_env();
+    client.initialize(&admin, &token_contract);
+
+    let report = client.dry_run_migration(&2);
+    assert_eq!(report.current_version, 1);
+    assert_eq!(report.target_version, 2);
+    assert_eq!(report.affected_shipments, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #47)")]
+fn test_upgrade_invalid_edge_fails() {
+    let (env, client, admin, token_contract) = setup_shipment_env();
+    let new_wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    client.initialize(&admin, &token_contract);
+
+    // Jump from 1 to 3 is not allowed
+    client.upgrade(&admin, &new_wasm_hash, &3);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #47)")]
+fn test_dry_run_invalid_edge_fails() {
+    let (_env, client, admin, token_contract) = setup_shipment_env();
+    client.initialize(&admin, &token_contract);
+
+    // Rollback from 1 to 0 is not allowed
+    client.dry_run_migration(&0);
 }
 
 // ============= Carrier Handoff Tests =============
@@ -5983,10 +6022,7 @@ fn test_resolve_dispute_fails_without_reason_hash() {
         &crate::DisputeResolution::ReleaseToCarrier,
         &empty_hash,
     );
-    assert_eq!(
-        res,
-        Err(Ok(crate::NavinError::DisputeResolutionReasonHashMissing))
-    );
+    assert_eq!(res, Err(Ok(crate::NavinError::DisputeReasonHashMissing)));
 }
 
 #[test]
@@ -9906,4 +9942,89 @@ fn test_guardian_can_resolve_disputes() {
 
     let shipment = client.get_shipment(&shipment_id);
     assert_eq!(shipment.status, ShipmentStatus::Cancelled);
+}
+
+#[test]
+fn test_get_canonical_hash() {
+    let (env, client, admin, token_contract) = setup_shipment_env();
+    client.initialize(&admin, &token_contract);
+
+    let mut fields = soroban_sdk::Vec::new(&env);
+    fields.push_back(Symbol::new(&env, "test").into_val(&env));
+    fields.push_back(123_u64.into_val(&env));
+
+    let hash1 = client.get_canonical_hash(&fields);
+    let hash2 = client.get_canonical_hash(&fields);
+
+    assert_eq!(hash1, hash2);
+
+    // Ensure different fields result in different hash
+    fields.push_back(456_u64.into_val(&env));
+    let hash3 = client.get_canonical_hash(&fields);
+    assert_ne!(hash1, hash3);
+fn test_report_condition_breach_limit_exceeded() {
+    let (env, client, admin, token_contract) = setup_shipment_env();
+    client.initialize(&admin, &token_contract);
+
+    let company = Address::generate(&env);
+    let carrier = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    let data_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline = env.ledger().timestamp() + 3600;
+
+    client.add_company(&admin, &company);
+    client.add_carrier(&admin, &carrier);
+
+    let shipment_id = client.create_shipment(
+        &company,
+        &receiver,
+        &carrier,
+        &data_hash,
+        &soroban_sdk::Vec::new(&env),
+        &deadline,
+    );
+
+    // Initial status update to move into InTransit
+    client.update_status(
+        &carrier,
+        &shipment_id,
+        &ShipmentStatus::InTransit,
+        &data_hash,
+    );
+
+    // Update config to have a small breach limit for testing
+    let config = crate::ContractConfig {
+        max_breaches_per_shipment: 2,
+        ..crate::ContractConfig::default()
+    };
+    client.update_config(&admin, &config);
+
+    // First breach - OK
+    client.report_condition_breach(
+        &carrier,
+        &shipment_id,
+        &BreachType::TemperatureHigh,
+        &Severity::Medium,
+        &data_hash,
+    );
+
+    // Second breach - OK
+    client.report_condition_breach(
+        &carrier,
+        &shipment_id,
+        &BreachType::Impact,
+        &Severity::High,
+        &data_hash,
+    );
+
+    // Third breach - Should fail
+    let res = client.try_report_condition_breach(
+        &carrier,
+        &shipment_id,
+        &BreachType::TamperDetected,
+        &Severity::Critical,
+        &data_hash,
+    );
+
+    assert_eq!(res, Err(Ok(crate::NavinError::BreachLimitExceeded)));
 }

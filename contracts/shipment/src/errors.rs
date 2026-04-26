@@ -36,10 +36,10 @@ pub enum NavinError {
     InvalidTimestamp = 10,
     /// Counter value overflowed the maximum capacity.
     CounterOverflow = 11,
-    /// Carrier is not listed in the company's whitelist.
-    CarrierNotWhitelisted = 12,
-    /// Carrier is not authorized to perform the action.
-    CarrierNotAuthorized = 13,
+    //    /// Carrier is not listed in the company's whitelist.
+    //    CarrierNotWhitelisted = 12,
+    //    /// Carrier is not authorized to perform the action.
+    //    CarrierNotAuthorized = 13,
     /// Amount provided is invalid (zero or negative).
     InvalidAmount = 14,
     /// Escrow for shipment has already been deposited.
@@ -85,7 +85,7 @@ pub enum NavinError {
     /// Arithmetic overflow/underflow encountered during escrow math operations.
     ArithmeticError = 35,
     /// Dispute resolution requires a reason hash.
-    DisputeResolutionReasonHashMissing = 36,
+    DisputeReasonHashMissing = 36,
     /// Company account is suspended from creating or updating shipments.
     CompanySuspended = 37,
     /// Action rejected because the shipment is finalized and locked.
@@ -106,4 +106,14 @@ pub enum NavinError {
     DataHashMismatch = 45,
     /// Circuit breaker is open; token transfers are temporarily disabled.
     CircuitBreakerOpen = 46,
+    /// Migration version transition is not allowed.
+    InvalidMigrationEdge = 47,
+    /// Maximum allowed milestone events for a shipment has been reached.
+    MilestoneLimitExceeded = 48,
+    /// Maximum allowed note events for a shipment has been reached.
+    NoteLimitExceeded = 49,
+    /// Maximum allowed evidence entries for a dispute has been reached.
+    EvidenceLimitExceeded = 50,
+    /// Maximum allowed condition breach events for a shipment has been reached.
+    BreachLimitExceeded = 51,
 }

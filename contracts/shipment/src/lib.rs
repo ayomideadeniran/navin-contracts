@@ -8,6 +8,7 @@ use soroban_sdk::{
 mod audit;
 mod circuit_breaker;
 mod config;
+pub mod consistency;
 pub mod diagnostics;
 mod e2e_test;
 mod errors;
@@ -17,9 +18,17 @@ mod rate_limit;
 mod recovery;
 mod storage;
 mod stress_test;
-mod test;
+pub mod test;
+#[cfg(test)]
+mod test_consistency;
+#[cfg(test)]
+mod test_cross_contract_integration;
 #[cfg(test)]
 mod test_finalization;
+#[cfg(test)]
+mod test_performance;
+#[cfg(test)]
+mod test_rollback;
 mod types;
 mod validation;
 
@@ -32,13 +41,18 @@ mod test_diagnostics;
 #[cfg(test)]
 mod test_iot_verification;
 #[cfg(test)]
+mod test_panic_free_invariants;
+#[cfg(test)]
 mod test_pause;
+#[cfg(test)]
+mod test_require_auth_for_args;
 #[cfg(test)]
 mod test_suspension;
 #[cfg(test)]
 mod test_utils;
 
 pub use config::*;
+pub use consistency::*;
 pub use diagnostics::*;
 pub use errors::*;
 pub use types::*;
@@ -52,6 +66,13 @@ fn extend_shipment_ttl(env: &Env, shipment_id: u64) {
         config.shipment_ttl_threshold,
         config.shipment_ttl_extension,
     );
+}
+
+/// Extend TTL using already-cached threshold/extension values, avoiding a
+/// redundant `get_config` storage read when called inside a batch loop.
+#[inline]
+fn extend_shipment_ttl_cached(env: &Env, shipment_id: u64, threshold: u32, extension: u32) {
+    storage::extend_shipment_ttl(env, shipment_id, threshold, extension);
 }
 
 fn validate_milestones(env: &Env, milestones: &Vec<(Symbol, u32)>) -> Result<(), NavinError> {
@@ -480,6 +501,13 @@ impl NavinShipment {
             require_active_company(&env, &reporter)?;
         }
 
+        // Check note event payload size guard
+        let config = config::get_config(&env);
+        let current_note_count = storage::get_note_count(&env, shipment_id);
+        if current_note_count >= config.max_notes_per_shipment {
+            return Err(NavinError::NoteLimitExceeded);
+        }
+
         // notes are append-only; we just increment the counter and store at the next index.
         let index = storage::increment_note_count(&env, shipment_id);
         storage::set_note_hash(&env, shipment_id, index, &note_hash);
@@ -536,6 +564,13 @@ impl NavinShipment {
         // If reporter is the company (sender), check for suspension
         if reporter == shipment.sender {
             require_active_company(&env, &reporter)?;
+        }
+
+        // Check evidence count payload size guard
+        let config = config::get_config(&env);
+        let current_evidence_count = storage::get_evidence_count(&env, shipment_id);
+        if current_evidence_count >= config.max_evidence_per_dispute {
+            return Err(NavinError::EvidenceLimitExceeded);
         }
 
         // Increment counter and store hash
@@ -745,6 +780,18 @@ impl NavinShipment {
         Ok(storage::get_version(&env))
     }
 
+    /// Get the current hash algorithm version used for data verification.
+    ///
+    /// # Arguments
+    /// * `env` - Execution environment.
+    ///
+    /// # Returns
+    /// * `Result<u32, NavinError>` - The hash algorithm version constant.
+    pub fn get_hash_algo_version(env: Env) -> Result<u32, NavinError> {
+        require_initialized(&env)?;
+        Ok(DEFAULT_HASH_ALGO)
+    }
+
     /// Get on-chain metadata for this contract.
     /// Returns version, admin, shipment count, and initialization status.
     /// Read-only — no authentication required.
@@ -769,6 +816,7 @@ impl NavinShipment {
             admin: storage::get_admin(&env),
             shipment_count: storage::get_shipment_counter(&env),
             initialized: true,
+            hash_algo_version: DEFAULT_HASH_ALGO,
         })
     }
 
@@ -864,6 +912,53 @@ impl NavinShipment {
                 Ok(config::compute_config_checksum(&current_config, &env))
             }
         }
+    }
+
+    /// Compute the idempotency key for a shipment event.
+    ///
+    /// This helper enables off-chain indexers to recompute the same idempotency
+    /// key that the contract emits in events. The key is used to deduplicate
+    /// events during indexing and to protect against duplicate submissions of
+    /// high-impact operations (e.g., dispute resolution).
+    ///
+    /// Canonical serialization order:
+    /// 1. `shipment_id` as big-endian u64 (8 bytes)
+    /// 2. `event_type` as XDR-encoded Symbol (variable-length)
+    /// 3. `event_counter` as big-endian u32 (4 bytes)
+    ///
+    /// The concatenated byte vector is hashed with SHA-256 to produce a
+    /// 32-byte idempotency key.
+    ///
+    /// # Arguments
+    /// * `env` - Execution environment.
+    /// * `shipment_id` - The shipment identifier.
+    /// * `event_type` - The event type symbol (e.g., "shipment_created").
+    /// * `event_counter` - The per-shipment event counter value.
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The idempotency key.
+    ///
+    /// # Examples
+    /// ```rust
+    /// let key = contract.compute_idempotency_key(&env, 1, Symbol::new(&env, "shipment_created"), 1);
+    /// ```
+    pub fn compute_idempotency_key(
+        env: Env,
+        shipment_id: u64,
+        event_type: Symbol,
+        event_counter: u32,
+    ) -> BytesN<32> {
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&soroban_sdk::Bytes::from_array(
+            &env,
+            &shipment_id.to_be_bytes(),
+        ));
+        payload.append(&event_type.clone().to_xdr(&env));
+        payload.append(&soroban_sdk::Bytes::from_array(
+            &env,
+            &event_counter.to_be_bytes(),
+        ));
+        env.crypto().sha256(&payload).into()
     }
 
     /// Add a carrier to a company's whitelist.
@@ -1588,7 +1683,13 @@ impl NavinShipment {
             storage::set_shipment_counter(&env, shipment_id);
             storage::increment_status_count(&env, &ShipmentStatus::Created);
             storage::increment_active_shipment_count(&env, &sender);
-            extend_shipment_ttl(&env, shipment_id);
+            // Use the cached-config variant to avoid re-reading config from storage per item.
+            extend_shipment_ttl_cached(
+                &env,
+                shipment_id,
+                config.shipment_ttl_threshold,
+                config.shipment_ttl_extension,
+            );
 
             events::emit_shipment_created(
                 &env,
@@ -2339,6 +2440,13 @@ impl NavinShipment {
             return Err(NavinError::InvalidStatus);
         }
 
+        // Enforce milestone event payload size guard
+        let config = config::get_config(&env);
+        let current_milestone_count = storage::get_milestone_event_count(&env, shipment_id);
+        if current_milestone_count >= config.max_milestones_per_shipment {
+            return Err(NavinError::MilestoneLimitExceeded);
+        }
+
         let timestamp = env.ledger().timestamp();
 
         let _milestone = Milestone {
@@ -2457,6 +2565,18 @@ impl NavinShipment {
             if data_hash.len() != 32 {
                 return Err(NavinError::InvalidHash);
             }
+        }
+
+        // Enforce milestone event payload size guard
+        let config = config::get_config(&env);
+        let current_milestone_count = storage::get_milestone_event_count(&env, shipment_id);
+        let new_milestones = milestones.len();
+        if current_milestone_count
+            .checked_add(new_milestones)
+            .ok_or(NavinError::ArithmeticError)?
+            > config.max_milestones_per_shipment
+        {
+            return Err(NavinError::MilestoneLimitExceeded);
         }
 
         // All validations passed, now process each milestone
@@ -2754,7 +2874,12 @@ impl NavinShipment {
     /// ```rust
     /// // contract.upgrade(env, admin, new_wasm_hash);
     /// ```
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), NavinError> {
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+        target_version: u32,
+    ) -> Result<(), NavinError> {
         require_initialized(&env)?;
         admin.require_auth();
 
@@ -2762,15 +2887,54 @@ impl NavinShipment {
             return Err(NavinError::Unauthorized);
         }
 
-        let new_version = storage::get_version(&env)
-            .checked_add(1)
-            .ok_or(NavinError::CounterOverflow)?;
+        let current_version = storage::get_version(&env);
 
-        storage::set_version(&env, new_version);
-        events::emit_contract_upgraded(&env, &admin, &new_wasm_hash, new_version);
+        // Enforce one-way migration guardrails and allowed edges
+        if !is_allowed_migration(current_version, target_version) {
+            return Err(NavinError::InvalidMigrationEdge);
+        }
+
+        let shipment_count = storage::get_shipment_counter(&env);
+
+        let report = MigrationReport {
+            current_version,
+            target_version,
+            affected_shipments: shipment_count,
+        };
+
+        storage::set_version(&env, target_version);
+        events::emit_contract_upgraded(&env, &admin, &new_wasm_hash, target_version);
+        events::emit_migration_report(&env, &report);
+
         env.deployer().update_current_contract_wasm(new_wasm_hash);
 
         Ok(())
+    }
+
+    /// Read-only dry-run for a proposed migration to estimate impact and validate edges.
+    ///
+    /// # Arguments
+    /// * `env` - Execution environment.
+    /// * `target_version` - The version to simulate migrating to.
+    ///
+    /// # Returns
+    /// * `Result<MigrationReport, NavinError>` - Summary of the migration impact.
+    pub fn dry_run_migration(env: Env, target_version: u32) -> Result<MigrationReport, NavinError> {
+        require_initialized(&env)?;
+
+        let current_version = storage::get_version(&env);
+
+        if !is_allowed_migration(current_version, target_version) {
+            return Err(NavinError::InvalidMigrationEdge);
+        }
+
+        let shipment_count = storage::get_shipment_counter(&env);
+
+        Ok(MigrationReport {
+            current_version,
+            target_version,
+            affected_shipments: shipment_count,
+        })
     }
 
     /// Release escrowed funds to the carrier after delivery confirmation.
@@ -3037,7 +3201,7 @@ impl NavinShipment {
     /// * `NavinError::NotInitialized` - If contract is not initialized.
     /// * `NavinError::ShipmentNotFound` - If the shipment doesn't exist.
     /// * `NavinError::Unauthorized` - If called by a non-admin.
-    /// * `NavinError::DisputeResolutionReasonHashMissing` - If reason_hash is all zeros.
+    /// * `NavinError::DisputeReasonHashMissing` - If reason_hash is all zeros.
     pub fn resolve_dispute(
         env: Env,
         admin: Address,
@@ -3053,8 +3217,18 @@ impl NavinShipment {
 
         // Validate reason hash is not empty
         if reason_hash == BytesN::from_array(&env, &[0u8; 32]) {
-            return Err(NavinError::DisputeResolutionReasonHashMissing);
+            return Err(NavinError::DisputeReasonHashMissing);
         }
+
+        // Idempotency: reject duplicate (shipment_id, resolution, reason_hash) within the window.
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&soroban_sdk::Bytes::from_array(
+            &env,
+            &shipment_id.to_be_bytes(),
+        ));
+        payload.append(&resolution.clone().to_xdr(&env));
+        payload.append(&reason_hash.clone().into());
+        check_idempotency(&env, payload)?;
 
         let mut shipment =
             storage::get_shipment(&env, shipment_id).ok_or(NavinError::ShipmentNotFound)?;
@@ -3262,6 +3436,13 @@ impl NavinShipment {
             return Err(NavinError::Unauthorized);
         }
 
+        // Enforce breach payload size guard
+        let config = config::get_config(&env);
+        let current_breach_count = storage::get_breach_event_count(&env, shipment_id);
+        if current_breach_count >= config.max_breaches_per_shipment {
+            return Err(NavinError::BreachLimitExceeded);
+        }
+
         events::emit_condition_breach(
             &env,
             shipment_id,
@@ -3273,6 +3454,9 @@ impl NavinShipment {
 
         // Reputation: record breach against carrier
         events::emit_carrier_breach(&env, &carrier, shipment_id, &breach_type, &severity);
+
+        // Increment breach event count
+        storage::increment_breach_event_count(&env, shipment_id);
 
         // Auto-open dispute on Critical breaches when the config toggle is enabled.
         // Skips silently if the shipment is already Disputed or Cancelled.
@@ -4132,4 +4316,75 @@ impl NavinShipment {
         require_initialized(&env)?;
         circuit_breaker::manual_reset(&env, &admin)
     }
+
+    /// Scan all tracked shipments and return every consistency violation found.
+    ///
+    /// Checks per-shipment invariants across the full ledger:
+    /// - Escrow amounts match storage
+    /// - Finalized flag is only set on terminal shipments with zero escrow
+    /// - Paid milestones are a subset of the payment schedule
+    /// - Timestamps are non-decreasing
+    /// - Deadlines are strictly after creation time
+    ///
+    /// Intended for periodic admin audits; not safe to call on hot paths
+    /// due to the O(n) scan over all shipments.
+    ///
+    /// # Arguments
+    /// * `env` - Execution environment.
+    /// * `admin` - Admin or operator address (auth required).
+    ///
+    /// # Returns
+    /// * `Result<Vec<ConsistencyViolation>, NavinError>` - List of detected violations.
+    ///   An empty vec means all invariants hold.
+    ///
+    /// # Errors
+    /// * `NavinError::NotInitialized` - If contract is not initialized.
+    /// * `NavinError::Unauthorized` - If caller is not admin or operator.
+    pub fn check_consistency_violations(
+        env: Env,
+        admin: Address,
+    ) -> Result<soroban_sdk::Vec<ConsistencyViolation>, NavinError> {
+        require_initialized(&env)?;
+        admin.require_auth();
+        require_admin_or_operator(&env, &admin)?;
+        Ok(consistency::check_all_consistency(&env))
+    }
+
+    /// Compute a canonical SHA-256 hash for a list of values.
+    ///
+    /// This utility allows off-chain systems to verify their hashing implementation
+    /// against the contract's canonical standard.
+    ///
+    /// # Arguments
+    /// * `env` - Execution environment.
+    /// * `fields` - List of values to hash.
+    ///
+    /// # Returns
+    /// * `BytesN<32>` - The computed canonical hash.
+    pub fn get_canonical_hash(env: Env, fields: Vec<soroban_sdk::Val>) -> BytesN<32> {
+        validation::compute_offchain_payload_hash(&env, fields)
+    }
+}
+
+/// Validates whether a version transition is permitted.
+///
+/// Standard upgrades are always allowed (current + 1).
+/// Backward migrations or jump migrations must be explicitly defined.
+fn is_allowed_migration(current: u32, target: u32) -> bool {
+    // Forward progression is the standard case
+    if target == current + 1 {
+        return true;
+    }
+
+    // Explicitly allowed edges (e.g. for emergency rollback or skip-version migrations)
+    // Format: &[(from_version, to_version)]
+    let allowed_edges: &[(u32, u32)] = &[];
+
+    for &(from, to) in allowed_edges {
+        if from == current && to == target {
+            return true;
+        }
+    }
+
+    false
 }
