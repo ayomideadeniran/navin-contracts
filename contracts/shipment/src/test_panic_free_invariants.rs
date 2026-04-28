@@ -5,11 +5,9 @@
 //! coverage for edge cases, boundary conditions, and malformed inputs on ALL public
 //! entry points prevents wallet/dApp crashes and improves production stability.
 
-#![cfg(test)]
-
 extern crate std;
 
-use crate::{NavinError, NavinShipment, NavinShipmentClient, ShipmentStatus};
+use crate::{NavinShipment, NavinShipmentClient, ShipmentStatus};
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger as _},
@@ -27,6 +25,9 @@ struct MockToken;
 impl MockToken {
     pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
         // Mock implementation - always succeeds
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
     }
 }
 
@@ -53,7 +54,7 @@ fn setup_env() -> (Env, NavinShipmentClient<'static>, Address, Address) {
 
 #[test]
 fn test_initialize_already_initialized_returns_error() {
-    let (env, client, admin, token) = setup_env();
+    let (_env, client, admin, token) = setup_env();
     // Already initialized in setup_env, second call must return error
     let result = client.try_initialize(&admin, &token);
     assert!(
@@ -90,7 +91,7 @@ fn test_add_company_not_initialized() {
 
     let admin = Address::generate(&env);
     let company = Address::generate(&env);
-    let token = env.register(MockToken {}, ());
+    let _token = env.register(MockToken {}, ());
     let contract_id = env.register(NavinShipment, ());
     let client = NavinShipmentClient::new(&env, &contract_id);
 
@@ -368,7 +369,7 @@ fn test_cancel_shipment_unauthorized_caller() {
 
 #[test]
 fn test_release_escrow_nonexistent_shipment() {
-    let (env, client, admin, _token) = setup_env();
+    let (env, client, _admin, _token) = setup_env();
     let caller = Address::generate(&env);
 
     let result = client.try_release_escrow(&caller, &999u64);
@@ -413,7 +414,7 @@ fn test_release_escrow_invalid_status() {
 
 #[test]
 fn test_refund_escrow_nonexistent_shipment() {
-    let (env, client, admin, _token) = setup_env();
+    let (env, client, _admin, _token) = setup_env();
     let caller = Address::generate(&env);
 
     let result = client.try_refund_escrow(&caller, &999u64);
@@ -429,7 +430,7 @@ fn test_refund_escrow_nonexistent_shipment() {
 
 #[test]
 fn test_raise_dispute_nonexistent_shipment() {
-    let (env, client, admin, _token) = setup_env();
+    let (env, client, _admin, _token) = setup_env();
     let caller = Address::generate(&env);
     let reason_hash = BytesN::from_array(&env, &[4u8; 32]);
 
